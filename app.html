@@ -1,0 +1,283 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta content='text/html;charset=utf-8' http-equiv='Content-Type'>
+                <meta content='utf-8' http-equiv='encoding'>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Encryptor App</title><link href='/res:style.css' rel='stylesheet' />
+
+                <script>
+                // from http://stackoverflow.com/questions/5515869/string-length-in-bytes-in-javascript
+                // using UTF8 strings I noticed that the javascript .length of a string returned less
+                // characters than they actually were
+                var pendingSendMessages = [];
+                var ws = null;
+                var comTimeout = null;
+                var failedConnections = 0;
+
+                function byteLength(str) {
+                    // returns the byte length of an utf8 string
+                    var s = str.length;
+                    for (var i=str.length-1; i>=0; i--) {
+                        var code = str.charCodeAt(i);
+                        if (code > 0x7f && code <= 0x7ff) s++;
+                        else if (code > 0x7ff && code <= 0xffff) s+=2;
+                        if (code >= 0xDC00 && code <= 0xDFFF) i--; //trail surrogate
+                    }
+                    return s;
+                }
+
+                var paramPacketize = function (ps){
+                    var ret = '';
+                    for (var pkey in ps) {
+                        if( ret.length>0 )ret = ret + '|';
+                        var pstring = pkey+'='+ps[pkey];
+                        var pstring_length = byteLength(pstring);
+                        pstring = pstring_length+'|'+pstring;
+                        ret = ret + pstring;
+                    }
+                    return ret;
+                };
+
+                function openSocket(){
+                    ws_wss = "ws";
+                    try{
+                        ws_wss = document.location.protocol.startsWith('https')?'wss':'ws';
+                    }catch(ex){}
+
+                    try{
+                        ws = new WebSocket(ws_wss + '://python-encryptor.bertik23.repl.co/');
+                        console.debug('opening websocket');
+                        ws.onopen = websocketOnOpen;
+                        ws.onmessage = websocketOnMessage;
+                        ws.onclose = websocketOnClose;
+                        ws.onerror = websocketOnError;
+                    }catch(ex){ws=false;alert('websocketnot supported or server unreachable');}
+                }
+                openSocket();
+
+                function websocketOnMessage (evt){
+                    var received_msg = evt.data;
+
+                    if( received_msg[0]=='0' ){ /*show_window*/
+                        var index = received_msg.indexOf(',')+1;
+                        /*var idRootNodeWidget = received_msg.substr(0,index-1);*/
+                        var content = received_msg.substr(index,received_msg.length-index);
+
+                        document.body.innerHTML = decodeURIComponent(content);
+                    }else if( received_msg[0]=='1' ){ /*update_widget*/
+                        var focusedElement=-1;
+                        var caretStart=-1;
+                        var caretEnd=-1;
+                        if (document.activeElement)
+                        {
+                            focusedElement = document.activeElement.id;
+                            try{
+                                caretStart = document.activeElement.selectionStart;
+                                caretEnd = document.activeElement.selectionEnd;
+                            }catch(e){}
+                        }
+                        var index = received_msg.indexOf(',')+1;
+                        var idElem = received_msg.substr(1,index-2);
+                        var content = received_msg.substr(index,received_msg.length-index);
+
+                        var elem = document.getElementById(idElem);
+                        try{
+                            elem.insertAdjacentHTML('afterend',decodeURIComponent(content));
+                            elem.parentElement.removeChild(elem);
+                        }catch(e){
+                            /*Microsoft EDGE doesn't support insertAdjacentHTML for SVGElement*/
+                            var ns = document.createElementNS("http://www.w3.org/2000/svg",'tmp');
+                            ns.innerHTML = decodeURIComponent(content);
+                            elem.parentElement.replaceChild(ns.firstChild, elem);
+                        }
+
+                        var elemToFocus = document.getElementById(focusedElement);
+                        if( elemToFocus != null ){
+                            elemToFocus.focus();
+                            try{
+                                elemToFocus = document.getElementById(focusedElement);
+                                if(caretStart>-1 && caretEnd>-1) elemToFocus.setSelectionRange(caretStart, caretEnd);
+                            }catch(e){}
+                        }
+                    }else if( received_msg[0]=='2' ){ /*javascript*/
+                        var content = received_msg.substr(1,received_msg.length-1);
+                        try{
+                            eval(content);
+                        }catch(e){console.debug(e.message);};
+                    }else if( received_msg[0]=='3' ){ /*ack*/
+                        pendingSendMessages.shift() /*remove the oldest*/
+                        if(comTimeout!=null)
+                            clearTimeout(comTimeout);
+                    }
+                };
+
+                /*this uses websockets*/
+                var sendCallbackParam = function (widgetID,functionName,params /*a dictionary of name:value*/){
+                    var paramStr = '';
+                    if(params!=null) paramStr=paramPacketize(params);
+                    var message = encodeURIComponent(unescape('callback' + '/' + widgetID+'/'+functionName + '/' + paramStr));
+                    pendingSendMessages.push(message);
+                    if( pendingSendMessages.length < 1000 ){
+                        ws.send(message);
+                        if(comTimeout==null)
+                            comTimeout = setTimeout(checkTimeout, 1000);
+                    }else{
+                        console.debug('Renewing connection, ws.readyState when trying to send was: ' + ws.readyState)
+                        renewConnection();
+                    }
+                };
+
+                /*this uses websockets*/
+                var sendCallback = function (widgetID,functionName){
+                    sendCallbackParam(widgetID,functionName,null);
+                };
+
+                function renewConnection(){
+                    // ws.readyState:
+                    //A value of 0 indicates that the connection has not yet been established.
+                    //A value of 1 indicates that the connection is established and communication is possible.
+                    //A value of 2 indicates that the connection is going through the closing handshake.
+                    //A value of 3 indicates that the connection has been closed or could not be opened.
+                    if( ws.readyState == 1){
+                        try{
+                            ws.close();
+                        }catch(err){};
+                    }
+                    else if(ws.readyState == 0){
+                    // Don't do anything, just wait for the connection to be stablished
+                    }
+                    else{
+                        openSocket();
+                    }
+                };
+
+                function checkTimeout(){
+                    if(pendingSendMessages.length>0)
+                        renewConnection();
+                };
+
+                function websocketOnClose(evt){
+                    /* websocket is closed. */
+                    console.debug('Connection is closed... event code: ' + evt.code + ', reason: ' + evt.reason);
+                    // Some explanation on this error: http://stackoverflow.com/questions/19304157/getting-the-reason-why-websockets-closed
+                    // In practice, on a unstable network (wifi with a lot of traffic for example) this error appears
+                    // Got it with Chrome saying:
+                    // WebSocket connection to 'ws://x.x.x.x:y/' failed: Could not decode a text frame as UTF-8.
+                    // WebSocket connection to 'ws://x.x.x.x:y/' failed: Invalid frame header
+
+                    try {
+                        document.getElementById("loading").style.display = '';
+                    } catch(err) {
+                        console.log('Error hiding loading overlay ' + err.message);
+                    }
+
+                    failedConnections += 1;
+
+                    console.debug('failed connections=' + failedConnections + ' queued messages=' + pendingSendMessages.length);
+
+                    if(failedConnections > 3) {
+
+                        // check if the server has been restarted - which would give it a new websocket address,
+                        // new state, and require a reload
+                        console.debug('Checking if GUI still up ' + location.href);
+
+                        var http = new XMLHttpRequest();
+                        http.open('HEAD', location.href);
+                        http.onreadystatechange = function() {
+                            if (http.status == 200) {
+                                // server is up but has a new websocket address, reload
+                                location.reload();
+                            }
+                        };
+                        http.send();
+
+                        failedConnections = 0;
+                    }
+
+                    if(evt.code == 1006){
+                        renewConnection();
+                    }
+
+                };
+
+                function websocketOnError(evt){
+                    /* websocket is closed. */
+                    /* alert('Websocket error...');*/
+                    console.debug('Websocket error... event code: ' + evt.code + ', reason: ' + evt.reason);
+                };
+
+                function websocketOnOpen(evt){
+                    if(ws.readyState == 1){
+                        ws.send('connected');
+
+                        try {
+                            document.getElementById("loading").style.display = 'none';
+                        } catch(err) {
+                            console.log('Error hiding loading overlay ' + err.message);
+                        }
+
+                        failedConnections = 0;
+
+                        while(pendingSendMessages.length>0){
+                            ws.send(pendingSendMessages.shift()); /*without checking ack*/
+                        }
+                    }
+                    else{
+                        console.debug('onopen fired but the socket readyState was not 1');
+                    }
+                };
+
+                function uploadFile(widgetID, eventSuccess, eventFail, eventData, file){
+                    var url = '/';
+                    var xhr = new XMLHttpRequest();
+                    var fd = new FormData();
+                    xhr.open('POST', url, true);
+                    xhr.setRequestHeader('filename', file.name);
+                    xhr.setRequestHeader('listener', widgetID);
+                    xhr.setRequestHeader('listener_function', eventData);
+                    xhr.onreadystatechange = function() {
+                        if (xhr.readyState == 4 && xhr.status == 200) {
+                            /* Every thing ok, file uploaded */
+                            var params={};params['filename']=file.name;
+                            sendCallbackParam(widgetID, eventSuccess,params);
+                            console.log('upload success: ' + file.name);
+                        }else if(xhr.status == 400){
+                            var params={};params['filename']=file.name;
+                            sendCallbackParam(widgetID,eventFail,params);
+                            console.log('upload failed: ' + file.name);
+                        }
+                    };
+                    fd.append('upload_file', file);
+                    xhr.send(fd);
+                };
+                </script>
+</head><body id="139862464510608" class="BODY" onload="sendCallback('139862464510608','onload');
+            event.stopPropagation();event.preventDefault();
+            return false;" onerror="var params={};params['message']=event.message;
+                params['source']=event.source;
+                params['lineno']=event.lineno;
+                params['colno']=event.colno;
+                sendCallbackParam('139862464510608','onerror',params);
+                return false;
+            " ononline="sendCallback('139862464510608','ononline');
+            event.stopPropagation();event.preventDefault();
+            return false;" onpagehide="sendCallback('139862464510608','onpagehide');
+            event.stopPropagation();event.preventDefault();
+            return false;" onpageshow="sendCallback('139862464510608','onpageshow');
+            event.stopPropagation();event.preventDefault();
+            return false;" onresize="
+            var params={};
+            params['width']=window.innerWidth;
+            params['height']=window.innerHeight;
+            sendCallbackParam('139862464510608','onresize',params);
+            event.stopPropagation();event.preventDefault();
+            return false;" data-parent-widget="139862520286224" style="margin:0px"><div id="loading" class="Widget" data-parent-widget="139862464510608" style="display:none"><div id="loading-animation" class="Widget" data-parent-widget="139862520284752"></div></div><div id="139862520357776" class="VBox" data-parent-widget="139862464509008" style="margin:0px;display:flex;justify-content:flex-start;align-items:baseline;flex-direction:column"><div id="139862520359504" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><p id="139862520397968" class="Label" data-parent-widget="139862520359504" style="margin:3px 5px 3px 5px;font-family:Helvetica;font-size:15px;height:26px;position:static;order:-1">Encode:</p></div><div id="139862520359824" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><textarea id="139862520401360" class="TextInput" autocomplete="off" onchange="var params={};params['new_value']=document.getElementById('139862520401360').value;sendCallbackParam('139862520401360','onchange',params);" data-parent-widget="139862520359824" style="margin:3px 5px 3px 5px;font-family:Helvetica;font-size:15px;height:26px;width:250px;position:static;order:-1"></textarea><button id="139862520427472" class="Button" onclick="sendCallback('139862520427472','onclick');event.stopPropagation();event.preventDefault();" data-parent-widget="139862520359824" style="margin:3px 5px 3px 5px;height:26px;font-family:Helvetica;background-color:#082567;color:white;font-size:15px;position:static;order:-1">Encode</button></div><div id="139862520401296" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><p id="139862520447248" class="Label" data-parent-widget="139862520401296" style="margin:3px 5px 3px 5px;font-family:Helvetica;font-size:15px;height:26px;position:static;order:-1">Decode:</p></div><div id="139862520429584" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><textarea id="139862520450512" class="TextInput" autocomplete="off" onchange="var params={};params['new_value']=document.getElementById('139862520450512').value;sendCallbackParam('139862520450512','onchange',params);" data-parent-widget="139862520429584" style="margin:3px 5px 3px 5px;font-family:Helvetica;font-size:15px;height:26px;width:250px;position:static;order:-1"></textarea><button id="139862520488912" class="Button" onclick="sendCallback('139862520488912','onclick');event.stopPropagation();event.preventDefault();" data-parent-widget="139862520429584" style="margin:3px 5px 3px 5px;height:26px;font-family:Helvetica;background-color:#082567;color:white;font-size:15px;position:static;order:-1">Decode</button></div><div id="139862520450448" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><p id="139862520516880" class="Label" data-parent-widget="139862520450448" style="margin:3px 5px 3px 5px;font-family:Helvetica;font-size:15px;height:26px;position:static;order:-1">Base</p><textarea id="139862520518800" class="TextInput_raw_onkeyup" rows="1" oninput="
+                var elem = document.getElementById('139862520518800');
+                var enter_pressed = (elem.value.indexOf('\n') > -1);
+                if(enter_pressed){
+                    elem.value = elem.value.split('\n').join(''); 
+                    var params={};params['new_value']=elem.value;
+                    sendCallbackParam('139862520518800','onchange',params);
+                }" autocomplete="off" onchange="var params={};params['new_value']=document.getElementById('139862520518800').value;sendCallbackParam('139862520518800','onchange',params);" data-parent-widget="139862520450448" style="margin:3px 5px 3px 5px;resize:none;font-family:Helvetica;font-size:15px;height:20px;width:50px;position:static;order:-1"></textarea></div><div id="139862520520400" class="HBox" data-parent-widget="139862520357776" style="margin:0px;display:flex;justify-content:flex-start;align-items:flex-start;flex-direction:row;position:static;order:-1"><textarea id="139862468609104" class="TextInput" autocomplete="off" onchange="var params={};params['new_value']=document.getElementById('139862468609104').value;sendCallbackParam('139862468609104','onchange',params);" disabled data-parent-widget="139862520520400" style="margin:3px 5px 3px 5px;font-family:Helvetica;color:black;font-size:15px;height:260px;width:400px;position:static;order:-1"></textarea></div><script id="139862520359376" class="Tag" data-parent-widget="139862520357776">window.onunload=function(e){sendCallback('139862464509008','on_window_close');return "close?";};</script></div></body>
+</html>
